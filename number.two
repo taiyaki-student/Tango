@@ -1,0 +1,890 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="単語帳">
+<meta name="theme-color" content="#0e0e0e">
+<title>マイ単語帳</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; background: #0e0e0e; overscroll-behavior: none; }
+  #root { height: 100%; }
+  input, button { font-family: inherit; }
+  /* iOS safe area */
+  body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+
+// ===================== AUDIO =====================
+function playBeep(type) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    if (type === "correct") {
+      o.frequency.setValueAtTime(880, ctx.currentTime);
+      o.frequency.setValueAtTime(1100, ctx.currentTime + 0.1);
+      g.gain.setValueAtTime(0.3, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+      o.start(); o.stop(ctx.currentTime + 0.4);
+    } else {
+      o.frequency.setValueAtTime(300, ctx.currentTime);
+      o.frequency.setValueAtTime(200, ctx.currentTime + 0.15);
+      g.gain.setValueAtTime(0.3, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+      o.start(); o.stop(ctx.currentTime + 0.4);
+    }
+  } catch (e) {}
+}
+
+function speakWord(word) {
+  if (!window.speechSynthesis) return;
+  const u = new SpeechSynthesisUtterance(word);
+  u.lang = "en-US"; u.rate = 0.9;
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(u);
+}
+
+// ===================== STORAGE =====================
+// Use a module-level variable so state never gets lost on re-render
+const _store = { data: null };
+const SK = "vapp2";
+
+function loadData() {
+  if (_store.data) return _store.data;
+  try {
+    const raw = sessionStorage.getItem(SK) || localStorage.getItem(SK);
+    if (raw) { _store.data = JSON.parse(raw); return _store.data; }
+  } catch (e) {}
+  const init = { files: [{ id: "f1", name: "単語帳 1", words: [], stats: {} }] };
+  _store.data = init;
+  return init;
+}
+
+function saveData(data) {
+  _store.data = data;
+  try { sessionStorage.setItem(SK, JSON.stringify(data)); } catch (e) {}
+  try { localStorage.setItem(SK, JSON.stringify(data)); } catch (e) {}
+}
+
+// ===================== HELPERS =====================
+function uid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+function getStat(stats, id) {
+  return (stats && stats[id]) ? stats[id] : { streak: 0, mastered: false, wrongStreak: 0 };
+}
+
+function parseImportText(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const result = [];
+  for (const line of lines) {
+    if (line.startsWith("#") || line.startsWith("//")) continue;
+    const sep = line.includes("\t") ? "\t" : ",";
+    const parts = line.split(sep).map(p => p.trim().replace(/^"|"$/g, ""));
+    if (parts.length >= 2 && parts[0] && parts[1]) {
+      result.push({ id: uid(), english: parts[0], japanese: parts[1] });
+    }
+  }
+  return result;
+}
+
+// ===================== MAIN APP =====================
+function VocabApp() {
+  const [data, setData] = useState(loadData);
+  const [screen, setScreen] = useState("home");
+  const [activeFileId, setActiveFileId] = useState(null);
+  const [quizConfig, setQuizConfig] = useState(null);
+
+  useEffect(() => { saveData(data); }, [data]);
+
+  const activeFile = data.files.find(f => f.id === activeFileId) || null;
+
+  // ---- File CRUD ----
+  const createFile = (name) => {
+    const nf = { id: uid(), name: name || `単語帳 ${data.files.length + 1}`, words: [], stats: {} };
+    setData(prev => ({ ...prev, files: [...prev.files, nf] }));
+  };
+  const renameFile = (fid, name) => {
+    setData(prev => ({ ...prev, files: prev.files.map(f => f.id === fid ? { ...f, name } : f) }));
+  };
+  const deleteFile = (fid) => {
+    setData(prev => ({ ...prev, files: prev.files.filter(f => f.id !== fid) }));
+  };
+
+  // ---- Word CRUD ----
+  const addWord = (fid, english, japanese) => {
+    setData(prev => ({
+      ...prev,
+      files: prev.files.map(f => {
+        if (f.id !== fid || f.words.length >= 100) return f;
+        return { ...f, words: [...f.words, { id: uid(), english, japanese }] };
+      })
+    }));
+  };
+  const deleteWord = (fid, wid) => {
+    setData(prev => ({
+      ...prev,
+      files: prev.files.map(f => f.id !== fid ? f : { ...f, words: f.words.filter(w => w.id !== wid) })
+    }));
+  };
+  const importWords = (fid, newWords) => {
+    setData(prev => ({
+      ...prev,
+      files: prev.files.map(f => {
+        if (f.id !== fid) return f;
+        return { ...f, words: [...f.words, ...newWords].slice(0, 100) };
+      })
+    }));
+  };
+
+  // ---- Stats ----
+  const updateStats = (fid, wid, correct) => {
+    setData(prev => ({
+      ...prev,
+      files: prev.files.map(f => {
+        if (f.id !== fid) return f;
+        const s = getStat(f.stats, wid);
+        const newStreak = correct ? s.streak + 1 : 0;
+        return {
+          ...f,
+          stats: {
+            ...f.stats,
+            [wid]: {
+              streak: newStreak,
+              mastered: correct ? newStreak >= 2 : false,
+              wrongStreak: correct ? 0 : s.wrongStreak + 1
+            }
+          }
+        };
+      })
+    }));
+  };
+
+  // ---- Memo groups (3+ consecutive wrong across all files) ----
+  const getMemoGroups = () => {
+    const bad = data.files.flatMap(f =>
+      f.words.filter(w => getStat(f.stats, w.id).wrongStreak >= 3).map(w => ({ ...w, _fid: f.id }))
+    );
+    const groups = [];
+    for (let i = 0; i < bad.length; i += 100) groups.push(bad.slice(i, i + 100));
+    return groups;
+  };
+
+  // ---- Navigation helpers ----
+  const nav = {
+    home: () => setScreen("home"),
+    fileDetail: (fid) => { setActiveFileId(fid); setScreen("fileDetail"); },
+    add: (fid) => { setActiveFileId(fid); setScreen("add"); },
+    import: (fid) => { setActiveFileId(fid); setScreen("import"); },
+    mode: (fid) => { setActiveFileId(fid); setScreen("mode"); },
+    quiz: (cfg) => { setQuizConfig(cfg); setScreen("quiz"); },
+    slide: (cfg) => { setQuizConfig(cfg); setScreen("slide"); },
+    memoQuiz: (words, i) => {
+      setQuizConfig({ words, direction: "en-ja", method: "choice", isMemo: true, memoIdx: i, fileId: "_memo" });
+      setScreen("quiz");
+    },
+  };
+
+  const memoGroups = getMemoGroups();
+
+  switch (screen) {
+    case "home":
+      return <HomeScreen data={data} memoGroups={memoGroups}
+        onCreate={createFile} onOpenFile={nav.fileDetail} onMemoQuiz={nav.memoQuiz} />;
+    case "fileDetail":
+      return <FileDetailScreen file={activeFile} onBack={nav.home}
+        onAdd={() => nav.add(activeFileId)} onImport={() => nav.import(activeFileId)}
+        onMode={() => nav.mode(activeFileId)} onDeleteWord={deleteWord}
+        onRename={renameFile} onDeleteFile={(fid) => { deleteFile(fid); nav.home(); }} />;
+    case "add":
+      return <AddScreen file={activeFile} onAdd={(en, ja) => addWord(activeFileId, en, ja)}
+        onBack={() => nav.fileDetail(activeFileId)} />;
+    case "import":
+      return <ImportScreen file={activeFile}
+        onImport={(words) => { importWords(activeFileId, words); nav.fileDetail(activeFileId); }}
+        onBack={() => nav.fileDetail(activeFileId)} />;
+    case "mode":
+      return <ModeScreen file={activeFile} onBack={() => nav.fileDetail(activeFileId)}
+        onStart={(cfg) => {
+          if (cfg.type === "slide") nav.slide({ ...cfg, fileId: activeFileId });
+          else nav.quiz({ ...cfg, fileId: activeFileId });
+        }} />;
+    case "quiz":
+      return <QuizScreen config={quizConfig}
+        updateStats={(wid, ok) => {
+          if (quizConfig.fileId !== "_memo") updateStats(quizConfig.fileId, wid, ok);
+          else {
+            const w = quizConfig.words.find(x => x.id === wid);
+            if (w && w._fid) updateStats(w._fid, wid, ok);
+          }
+        }}
+        onBack={quizConfig?.isMemo ? nav.home : () => nav.fileDetail(activeFileId)} />;
+    case "slide":
+      return <SlideScreen config={quizConfig}
+        updateStats={(wid, ok) => updateStats(quizConfig.fileId, wid, ok)}
+        onBack={() => nav.fileDetail(activeFileId)} />;
+    default: return null;
+  }
+}
+
+// ===================== HOME =====================
+function HomeScreen({ data, memoGroups, onCreate, onOpenFile, onMemoQuiz }) {
+  const [newName, setNewName] = useState("");
+  const [creating, setCreating] = useState(false);
+  const totalWords = data.files.reduce((s, f) => s + f.words.length, 0);
+  const totalMastered = data.files.reduce((s, f) =>
+    s + f.words.filter(w => getStat(f.stats, w.id).mastered).length, 0);
+
+  return (
+    <div style={S.page}>
+      <div style={S.homeHeader}>
+        <div style={S.homeTitle}>📖 マイ単語帳</div>
+        <div style={S.homeSub}>{totalWords}語 · {totalMastered}語習得</div>
+      </div>
+
+      <div style={{ padding: "16px 20px 0" }}>
+        <div style={S.label}>ファイル一覧</div>
+        {data.files.map(f => {
+          const mastered = f.words.filter(w => getStat(f.stats, w.id).mastered).length;
+          const pct = f.words.length > 0 ? Math.round((mastered / f.words.length) * 100) : 0;
+          return (
+            <div key={f.id} style={S.fileCard} onClick={() => onOpenFile(f.id)}>
+              <div style={{ flex: 1 }}>
+                <div style={S.fileCardName}>{f.name}</div>
+                <div style={S.fileCardMeta}>{f.words.length}/100語 · 習得{mastered}語</div>
+                <div style={S.progTrack}><div style={{ ...S.progBar2, width: `${pct}%` }} /></div>
+              </div>
+              <div style={{ color: "#444", fontSize: 22 }}>›</div>
+            </div>
+          );
+        })}
+
+        {creating ? (
+          <div style={S.newForm}>
+            <input style={S.newInput} autoFocus placeholder="ファイル名" value={newName}
+              onChange={e => setNewName(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === "Enter" && newName.trim()) { onCreate(newName.trim()); setNewName(""); setCreating(false); }
+                if (e.key === "Escape") { setCreating(false); setNewName(""); }
+              }} />
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <button style={S.cancelBtn} onClick={() => { setCreating(false); setNewName(""); }}>キャンセル</button>
+              <button style={S.confirmBtn} onClick={() => {
+                if (newName.trim()) { onCreate(newName.trim()); setNewName(""); setCreating(false); }
+              }}>作成</button>
+            </div>
+          </div>
+        ) : (
+          <button style={S.newFileBtn} onClick={() => setCreating(true)}>＋ 新しいファイルを作成</button>
+        )}
+      </div>
+
+      {memoGroups.length > 0 && (
+        <div style={{ padding: "20px 20px 0" }}>
+          <div style={S.label}>⚠️ 要暗記ファイル</div>
+          {memoGroups.map((grp, i) => (
+            <button key={i} style={S.memoBtn} onClick={() => onMemoQuiz(grp, i)}>
+              <span>要暗記ファイル {i + 1}（{grp.length}語）</span>
+              <span style={{ color: "#ff7043", fontSize: 13 }}>学習する →</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ===================== FILE DETAIL =====================
+function FileDetailScreen({ file, onBack, onAdd, onImport, onMode, onDeleteWord, onRename, onDeleteFile }) {
+  const [editing, setEditing] = useState(false);
+  const [nameVal, setNameVal] = useState("");
+  const [showList, setShowList] = useState(false);
+  const [confirmDel, setConfirmDel] = useState(false);
+  if (!file) return null;
+  const stats = file.stats || {};
+  const mastered = file.words.filter(w => getStat(stats, w.id).mastered).length;
+
+  const commitRename = () => { onRename(file.id, nameVal.trim() || file.name); setEditing(false); };
+
+  return (
+    <div style={S.page}>
+      <div style={S.topBar}>
+        <button style={S.backBtn} onClick={onBack}>← 戻る</button>
+        {editing ? (
+          <input style={{ flex: 1, background: "#1e1e1e", border: "1px solid #444", borderRadius: 6, padding: "4px 10px", color: "#fff", fontSize: 15, outline: "none", fontFamily: "inherit" }}
+            autoFocus value={nameVal} onChange={e => setNameVal(e.target.value)}
+            onBlur={commitRename} onKeyDown={e => { if (e.key === "Enter") commitRename(); }} />
+        ) : (
+          <div style={{ ...S.topBarTitle, cursor: "pointer" }}
+            onClick={() => { setNameVal(file.name); setEditing(true); }}>
+            {file.name} <span style={{ fontSize: 12, color: "#555" }}>✏️</span>
+          </div>
+        )}
+      </div>
+
+      <div style={{ padding: "10px 20px 0", color: "#555", fontSize: 12 }}>
+        {file.words.length}/100語 · {mastered}語習得
+      </div>
+
+      <div style={S.actionGrid}>
+        <button style={{ ...S.actionBtn, background: file.words.length < 4 ? "#1a1a1a" : "linear-gradient(135deg,#1565c0,#0d47a1)", opacity: file.words.length < 4 ? 0.5 : 1 }}
+          disabled={file.words.length < 4} onClick={onMode}>
+          <span style={S.aIcon}>🎯</span>
+          <span style={S.aLabel}>学習スタート</span>
+          {file.words.length < 4 && <span style={S.aSub}>4語以上必要</span>}
+        </button>
+        <button style={{ ...S.actionBtn, background: "linear-gradient(135deg,#2e7d32,#1b5e20)" }} onClick={onAdd}>
+          <span style={S.aIcon}>＋</span><span style={S.aLabel}>単語を追加</span>
+        </button>
+        <button style={{ ...S.actionBtn, background: "linear-gradient(135deg,#6a1b9a,#4a148c)" }} onClick={onImport}>
+          <span style={S.aIcon}>📂</span><span style={S.aLabel}>ファイル読込</span>
+        </button>
+        <button style={{ ...S.actionBtn, background: "#1a1a1a", border: "1px solid #2a2a2a" }}
+          onClick={() => setShowList(v => !v)}>
+          <span style={S.aIcon}>📋</span>
+          <span style={S.aLabel}>{showList ? "リストを閉じる" : "単語一覧"}</span>
+        </button>
+      </div>
+
+      {showList && (
+        <div style={{ padding: "0 20px" }}>
+          {file.words.length === 0 && <div style={{ color: "#444", fontSize: 13, padding: "12px 0" }}>まだ単語がありません</div>}
+          {file.words.map(w => {
+            const s = getStat(stats, w.id);
+            return (
+              <div key={w.id} style={S.wordRow}>
+                <div>
+                  <div style={S.wordEn}>{w.english}</div>
+                  <div style={S.wordJa}>{w.japanese}</div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ ...S.badge, background: s.mastered ? "#1b5e20" : s.streak > 0 ? "#0d3a8e" : "#222" }}>
+                    {s.mastered ? "習得" : s.streak > 0 ? `${s.streak}連` : "未"}
+                  </span>
+                  <button style={S.delBtn} onClick={() => onDeleteWord(file.id, w.id)}>✕</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div style={{ padding: "20px" }}>
+        {!confirmDel
+          ? <button style={S.dangerBtn} onClick={() => setConfirmDel(true)}>このファイルを削除</button>
+          : <div style={S.confirmBox}>
+              <div style={{ color: "#ff5252", fontSize: 13, marginBottom: 10 }}>本当に削除しますか？（元に戻せません）</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button style={S.cancelBtn} onClick={() => setConfirmDel(false)}>キャンセル</button>
+                <button style={{ ...S.dangerBtn, flex: 1 }} onClick={() => onDeleteFile(file.id)}>削除する</button>
+              </div>
+            </div>
+        }
+      </div>
+    </div>
+  );
+}
+
+// ===================== ADD =====================
+function AddScreen({ file, onAdd, onBack }) {
+  const [en, setEn] = useState("");
+  const [ja, setJa] = useState("");
+  const [added, setAdded] = useState([]);
+  const jaRef = useRef(null);
+  const enRef = useRef(null);
+  const full = file && (file.words.length + added.length >= 100);
+
+  const handleAdd = () => {
+    if (!en.trim() || !ja.trim() || full) return;
+    onAdd(en.trim(), ja.trim());
+    setAdded(prev => [{ en: en.trim(), ja: ja.trim() }, ...prev]);
+    setEn(""); setJa("");
+    setTimeout(() => enRef.current?.focus(), 30);
+  };
+
+  return (
+    <div style={S.page}>
+      <div style={S.topBar}>
+        <button style={S.backBtn} onClick={onBack}>← 戻る</button>
+        <div style={S.topBarTitle}>単語を追加 — {file?.name}</div>
+      </div>
+      {full && <div style={S.warnBox}>このファイルは上限（100語）に達しています</div>}
+      <div style={S.addForm}>
+        <input ref={enRef} style={S.input} autoFocus disabled={full}
+          placeholder="英語 / 英熟語（例: get in touch with）"
+          value={en} onChange={e => setEn(e.target.value)}
+          onKeyDown={e => e.key === "Enter" && jaRef.current?.focus()} />
+        <input ref={jaRef} style={S.input} disabled={full}
+          placeholder="和訳（例: 〜と連絡をとる）"
+          value={ja} onChange={e => setJa(e.target.value)}
+          onKeyDown={e => e.key === "Enter" && handleAdd()} />
+        <button style={{ ...S.primaryBtn, opacity: full ? 0.4 : 1 }} disabled={full} onClick={handleAdd}>
+          追加する
+        </button>
+      </div>
+      {added.length > 0 && (
+        <div style={{ padding: "0 20px" }}>
+          <div style={{ color: "#555", fontSize: 12, marginBottom: 8 }}>追加済み {added.length}語</div>
+          {added.map((w, i) => (
+            <div key={i} style={S.addedRow}>
+              <span style={S.wordEn}>{w.en}</span>
+              <span style={S.wordJa}>{w.ja}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ===================== IMPORT =====================
+function ImportScreen({ file, onImport, onBack }) {
+  const [preview, setPreview] = useState(null);
+  const [error, setError] = useState("");
+  const fileRef = useRef(null);
+  const remaining = file ? 100 - file.words.length : 0;
+
+  const handleFile = (f) => {
+    if (!f) return;
+    const ext = f.name.split(".").pop().toLowerCase();
+    if (!["txt", "csv", "tsv"].includes(ext)) {
+      setError("対応形式: .txt / .csv / .tsv\n（Excelは「名前を付けて保存」→CSV UTF-8）");
+      setPreview(null); return;
+    }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const words = parseImportText(e.target.result);
+      if (!words.length) { setError("読み込めませんでした。形式を確認してください。"); setPreview(null); return; }
+      setError(""); setPreview(words);
+    };
+    reader.onerror = () => setError("ファイルの読み込みに失敗しました");
+    reader.readAsText(f, "UTF-8");
+  };
+
+  const addCount = preview ? Math.min(preview.length, remaining) : 0;
+
+  return (
+    <div style={S.page}>
+      <div style={S.topBar}>
+        <button style={S.backBtn} onClick={onBack}>← 戻る</button>
+        <div style={S.topBarTitle}>ファイル読込 — {file?.name}</div>
+      </div>
+
+      <div style={{ padding: "20px" }}>
+        <div style={S.hintBox}>
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>📋 対応フォーマット</div>
+          <div style={{ color: "#aaa", fontSize: 13, lineHeight: 1.9 }}>
+            ファイル形式: <code style={{ color: "#81d4fa" }}>.txt</code> / <code style={{ color: "#81d4fa" }}>.csv</code> / <code style={{ color: "#81d4fa" }}>.tsv</code><br />
+            Excelの場合は「名前を付けて保存」→「CSV UTF-8」を選択<br /><br />
+            1行1単語、カンマ区切りまたはタブ区切り:<br />
+            <code style={{ color: "#a5d6a7" }}>helpful,役に立つ</code><br />
+            <code style={{ color: "#a5d6a7" }}>get in touch with,〜と連絡を取る</code>
+          </div>
+        </div>
+
+        <div style={{ color: "#555", fontSize: 12, marginBottom: 12 }}>
+          残り{remaining}枠 ({file?.words.length}/100語)
+        </div>
+
+        <button style={S.uploadBtn} onClick={() => fileRef.current?.click()}>
+          📂 ファイルを選択してインポート
+        </button>
+        <input ref={fileRef} type="file" accept=".txt,.csv,.tsv"
+          style={{ display: "none" }} onChange={e => handleFile(e.target.files[0])} />
+
+        {error && (
+          <div style={S.warnBox}>{error}</div>
+        )}
+
+        {preview && (
+          <div style={{ marginTop: 16 }}>
+            <div style={{ color: "#aaa", fontSize: 13, marginBottom: 8 }}>
+              {preview.length}語検出 → <span style={{ color: "#4caf50" }}>{addCount}語追加可能</span>
+              {preview.length > addCount && <span style={{ color: "#ff9800" }}>（残り{preview.length - addCount}語は上限のためスキップ）</span>}
+            </div>
+            <div style={{ maxHeight: 200, overflowY: "auto", marginBottom: 12 }}>
+              {preview.slice(0, addCount).map((w, i) => (
+                <div key={i} style={S.addedRow}>
+                  <span style={S.wordEn}>{w.english}</span>
+                  <span style={S.wordJa}>{w.japanese}</span>
+                </div>
+              ))}
+            </div>
+            {addCount > 0 && (
+              <button style={S.primaryBtn}
+                onClick={() => onImport(preview.slice(0, addCount))}>
+                {addCount}語を追加する
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ===================== MODE =====================
+function ModeScreen({ file, onStart, onBack }) {
+  const [direction, setDirection] = useState("en-ja");
+  const [method, setMethod] = useState("choice");
+  const [count, setCount] = useState(10);
+  const dirs = [{ k: "en-ja", l: "英→日" }, { k: "ja-en", l: "日→英" }];
+  const methods = [{ k: "choice", l: "4択" }, { k: "write", l: "記述" }, { k: "slide", l: "単語帳" }];
+  const total = file?.words.length || 0;
+  const countOptions = [10, 20, 30, 50, total].filter((v, i, a) => v <= total && a.indexOf(v) === i);
+
+  return (
+    <div style={S.page}>
+      <div style={S.topBar}>
+        <button style={S.backBtn} onClick={onBack}>← 戻る</button>
+        <div style={S.topBarTitle}>学習モード</div>
+      </div>
+      <div style={{ padding: "20px" }}>
+        <div style={S.label}>出題方向</div>
+        <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
+          {dirs.map(d => (
+            <button key={d.k} style={{ ...S.modeBtn, ...(direction === d.k ? S.modeBtnOn : {}) }}
+              onClick={() => setDirection(d.k)}>{d.l}</button>
+          ))}
+        </div>
+        <div style={S.label}>学習タイプ</div>
+        <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
+          {methods.map(m => (
+            <button key={m.k} style={{ ...S.modeBtn, ...(method === m.k ? S.modeBtnOn : {}) }}
+              onClick={() => setMethod(m.k)}>{m.l}</button>
+          ))}
+        </div>
+        <div style={S.label}>出題数</div>
+        <div style={{ display: "flex", gap: 10, marginBottom: 24, flexWrap: "wrap" }}>
+          {countOptions.map(n => (
+            <button key={n}
+              style={{ ...S.modeBtn, flex: "none", minWidth: 60, ...(count === n ? S.modeBtnOn : {}) }}
+              onClick={() => setCount(n)}>
+              {n === total ? `全${n}問` : `${n}問`}
+            </button>
+          ))}
+        </div>
+        <div style={{ color: "#444", fontSize: 12, marginBottom: 16 }}>
+          {file?.name} · {total}語中 {Math.min(count, total)}問出題
+        </div>
+        <button style={S.primaryBtn} onClick={() => {
+          const words = shuffle(file?.words || []).slice(0, count);
+          onStart({
+            direction, method, type: method === "slide" ? "slide" : "quiz",
+            words, stats: file?.stats || {}
+          });
+        }}>
+          スタート ▶
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ===================== QUIZ =====================
+function QuizScreen({ config, updateStats, onBack }) {
+  const allWords = config.words || [];
+  // FIX: queue computed once at mount only — never re-shuffled during session
+  const [queue] = useState(() => shuffle(allWords));
+  const [idx, setIdx] = useState(0);
+  const [choices, setChoices] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [answered, setAnswered] = useState(false);
+  const [input, setInput] = useState("");
+  const [hint, setHint] = useState(false);
+  const [finished, setFinished] = useState(false);
+  const [session, setSession] = useState({ correct: 0, wrong: 0 });
+  const [liveStats, setLiveStats] = useState(() => ({ ...(config.stats || {}) }));
+
+  const isEnJa = config.direction === "en-ja";
+  const isChoice = config.method === "choice";
+  const isWrite = config.method === "write";
+  const word = queue[idx];
+
+  // Reset state and build choices when question changes
+  useEffect(() => {
+    if (!word) return;
+    setSelected(null); setAnswered(false); setInput(""); setHint(false);
+    if (isChoice) {
+      const others = shuffle(allWords.filter(w => w.id !== word.id)).slice(0, 3);
+      setChoices(shuffle([word, ...others]));
+    }
+    if (isEnJa && isChoice) speakWord(word.english);
+  }, [idx]);
+
+  const recordAnswer = (correct) => {
+    if (answered) return;
+    setAnswered(true);
+    playBeep(correct ? "correct" : "wrong");
+    // update local mirror for streak dots
+    setLiveStats(ls => {
+      const prev = getStat(ls, word.id);
+      const newStreak = correct ? prev.streak + 1 : 0;
+      return { ...ls, [word.id]: { streak: newStreak, mastered: correct && newStreak >= 2, wrongStreak: correct ? 0 : prev.wrongStreak + 1 } };
+    });
+    updateStats(word.id, correct);
+    setSession(s => ({ correct: s.correct + (correct ? 1 : 0), wrong: s.wrong + (correct ? 0 : 1) }));
+  };
+
+  const next = () => { if (idx + 1 >= queue.length) setFinished(true); else setIdx(i => i + 1); };
+
+  if (!word || finished) return (
+    <div style={S.page}>
+      <div style={S.topBar}><button style={S.backBtn} onClick={onBack}>← 戻る</button></div>
+      <div style={S.finishBox}>
+        <div style={{ fontSize: 56 }}>🎉</div>
+        <div style={{ fontSize: 22, fontWeight: 800 }}>完了！</div>
+        <div style={{ display: "flex", gap: 20, marginTop: 8 }}>
+          <span style={{ color: "#4caf50" }}>✓ {session.correct}正解</span>
+          <span style={{ color: "#f44336" }}>✗ {session.wrong}不正解</span>
+        </div>
+        <button style={{ ...S.primaryBtn, marginTop: 24, width: "auto", padding: "12px 40px" }} onClick={onBack}>戻る</button>
+      </div>
+    </div>
+  );
+
+  const question = isEnJa ? word.english : word.japanese;
+  const answer = isEnJa ? word.japanese : word.english;
+  const s = getStat(liveStats, word.id);
+
+  const streakDots = (n) => [0, 1].map(i => (
+    <span key={i} style={{ display: "inline-block", width: 9, height: 9, borderRadius: "50%", background: i < n ? "#4caf50" : "#2a2a2a", margin: "0 2px", border: "1px solid #333" }} />
+  ));
+
+  return (
+    <div style={S.page}>
+      <div style={S.topBar}>
+        <button style={S.backBtn} onClick={onBack}>← 戻る</button>
+        <div style={S.topBarTitle}>
+          {config.isMemo ? "要暗記" : (isEnJa ? "英→日" : "日→英")} {isChoice ? "4択" : "記述"}
+        </div>
+        <div style={{ color: "#444", fontSize: 13 }}>{idx + 1}/{queue.length}</div>
+      </div>
+
+      <div style={S.progTrack2}><div style={{ ...S.progFill, width: `${(idx / queue.length) * 100}%` }} /></div>
+
+      {/* Question Card */}
+      <div style={S.qCard}>
+        <div style={{ position: "absolute", top: 12, left: 14, display: "flex", alignItems: "center", gap: 5 }}>
+          {s.wrongStreak >= 3
+            ? <span style={{ color: "#f44336", fontSize: 11 }}>⚠️ 要暗記</span>
+            : streakDots(s.streak)}
+          {s.mastered && <span style={S.masteredBadge}>習得済</span>}
+        </div>
+        {isEnJa && (
+          <button style={S.speakBtn} onClick={() => speakWord(word.english)}>🔊</button>
+        )}
+        <div style={S.qWord}>{question}</div>
+        {answered && isWrite && (
+          <div style={{ marginTop: 10, fontSize: 13, color: "#777" }}>
+            正解: <span style={{ color: "#4caf50", fontWeight: 700 }}>{answer}</span>
+          </div>
+        )}
+      </div>
+
+      {/* 4択 */}
+      {isChoice && (
+        <div style={{ padding: "12px 20px 0", display: "flex", flexDirection: "column", gap: 10 }}>
+          {choices.map(ch => {
+            const isCorrect = ch.id === word.id;
+            const isSel = selected === ch.id;
+            return (
+              <button key={ch.id} onClick={() => { setSelected(ch.id); recordAnswer(isCorrect); }}
+                style={{
+                  ...S.choiceBtn,
+                  background: answered ? (isCorrect ? "#0a3020" : isSel ? "#2a0808" : "#151515") : "#181818",
+                  border: answered && isCorrect ? "1.5px solid #2e7d32" : "1.5px solid #222",
+                  opacity: answered && !isCorrect && !isSel ? 0.35 : 1,
+                }}>
+                <span style={{ flex: 1, textAlign: "left" }}>{isEnJa ? ch.japanese : ch.english}</span>
+                {answered && isCorrect && <span style={{ color: "#4caf50" }}>✓</span>}
+                {answered && isSel && !isCorrect && <span style={{ color: "#f44336" }}>✗</span>}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* 記述 */}
+      {isWrite && !answered && (
+        <div style={{ padding: "12px 20px 0" }}>
+          <input style={S.writeInput} autoFocus
+            placeholder={isEnJa ? "日本語で入力" : "英語で入力"}
+            value={input} onChange={e => setInput(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && recordAnswer(input.trim() === answer)} />
+          {hint && <div style={{ color: "#ff9800", fontSize: 12, marginTop: 5 }}>ヒント: {answer[0]}...</div>}
+          <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+            {!hint
+              ? <button style={S.hintBtn} onClick={() => setHint(true)}>💡 ヒント</button>
+              : <button style={{ ...S.hintBtn, background: "#1a0808", color: "#ff5252" }} onClick={() => recordAnswer(false)}>わからない</button>
+            }
+            <button style={S.ansBtn} onClick={() => recordAnswer(input.trim() === answer)}>回答する</button>
+          </div>
+        </div>
+      )}
+
+      {answered && (
+        <div style={{ padding: "12px 20px 0" }}>
+          <button style={S.nextBtn} onClick={next}>
+            {idx + 1 >= queue.length ? "結果を見る 🎉" : "次の問題 →"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ===================== SLIDE =====================
+function SlideScreen({ config, updateStats, onBack }) {
+  const [queue] = useState(() => shuffle(config.words || []));
+  const [idx, setIdx] = useState(0);
+  const [revealed, setRevealed] = useState(false);
+  const [finished, setFinished] = useState(false);
+  const [liveStats, setLiveStats] = useState(() => ({ ...(config.stats || {}) }));
+
+  const word = queue[idx];
+  const isEnJa = config.direction === "en-ja";
+
+  const doUpdate = (correct) => {
+    setLiveStats(ls => {
+      const prev = getStat(ls, word.id);
+      const ns = correct ? prev.streak + 1 : 0;
+      return { ...ls, [word.id]: { streak: ns, mastered: correct && ns >= 2, wrongStreak: correct ? 0 : prev.wrongStreak + 1 } };
+    });
+    updateStats(word.id, correct);
+  };
+
+  const advance = () => { setRevealed(false); if (idx + 1 >= queue.length) setFinished(true); else setIdx(i => i + 1); };
+
+  if (!word || finished) return (
+    <div style={S.page}>
+      <div style={S.topBar}><button style={S.backBtn} onClick={onBack}>← 戻る</button></div>
+      <div style={S.finishBox}>
+        <div style={{ fontSize: 56 }}>📚</div>
+        <div style={{ fontSize: 22, fontWeight: 800 }}>一周完了！</div>
+        <button style={{ ...S.primaryBtn, marginTop: 24, width: "auto", padding: "12px 40px" }} onClick={onBack}>戻る</button>
+      </div>
+    </div>
+  );
+
+  const front = isEnJa ? word.english : word.japanese;
+  const back = isEnJa ? word.japanese : word.english;
+  const s = getStat(liveStats, word.id);
+
+  return (
+    <div style={S.page}>
+      <div style={S.topBar}>
+        <button style={S.backBtn} onClick={onBack}>← 戻る</button>
+        <div style={S.topBarTitle}>{isEnJa ? "英→日" : "日→英"} カード</div>
+        <div style={{ color: "#444", fontSize: 13 }}>{idx + 1}/{queue.length}</div>
+      </div>
+      <div style={S.progTrack2}><div style={{ ...S.progFill, width: `${(idx / queue.length) * 100}%` }} /></div>
+
+      <div style={S.slideCard}
+        onClick={() => { if (!revealed) { setRevealed(true); if (isEnJa) speakWord(word.english); } }}>
+        {s.mastered && <span style={{ ...S.masteredBadge, marginBottom: 12 }}>習得済</span>}
+        <div style={{ fontSize: 30, fontWeight: 800, textAlign: "center" }}>{front}</div>
+        {!revealed && <div style={{ color: "#333", fontSize: 12, marginTop: 12 }}>タップして{isEnJa ? "和訳" : "英語"}を表示</div>}
+        {revealed && <div style={{ marginTop: 20, fontSize: 20, color: "#64b5f6", textAlign: "center" }}>{back}</div>}
+      </div>
+
+      <div style={{ display: "flex", gap: 12, padding: "16px 20px 0" }}>
+        <button style={{ ...S.slideBtn, background: "#0d2a4a" }} onClick={() => {
+          if (!revealed) { setRevealed(true); if (isEnJa) speakWord(word.english); return; }
+          doUpdate(false); advance();
+        }}>
+          {revealed ? "✗ 知らない" : "? 知らない"}
+        </button>
+        <button style={{ ...S.slideBtn, background: "#0a2e12" }} onClick={() => { doUpdate(true); advance(); }}>
+          👍 知ってる
+        </button>
+      </div>
+      <div style={{ textAlign: "center", marginTop: 8 }}>
+        <button style={{ background: "none", border: "none", color: "#333", cursor: "pointer", fontSize: 13 }} onClick={advance}>
+          次へ →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ===================== STYLES =====================
+const S = {
+  page: { minHeight: "100vh", background: "#0e0e0e", color: "#e8e8e8", fontFamily: "'Hiragino Sans','Yu Gothic',sans-serif", maxWidth: 480, margin: "0 auto", paddingBottom: 48 },
+  homeHeader: { background: "linear-gradient(160deg,#0a0f1e 0%,#111827 100%)", padding: "32px 20px 20px", borderBottom: "1px solid #1a1a1a" },
+  homeTitle: { fontSize: 24, fontWeight: 800, letterSpacing: -0.5 },
+  homeSub: { color: "#444", fontSize: 12, marginTop: 4 },
+  label: { fontSize: 10, color: "#555", fontWeight: 700, letterSpacing: 1.5, textTransform: "uppercase", marginBottom: 10 },
+  fileCard: { background: "#141414", border: "1px solid #1e1e1e", borderRadius: 14, padding: "14px 16px", marginBottom: 8, cursor: "pointer", display: "flex", alignItems: "center", gap: 12 },
+  fileCardName: { fontWeight: 700, fontSize: 15 },
+  fileCardMeta: { color: "#444", fontSize: 11, marginTop: 3 },
+  progTrack: { height: 2, background: "#1e1e1e", borderRadius: 1, marginTop: 8 },
+  progBar2: { height: "100%", background: "#1a73e8", borderRadius: 1 },
+  newFileBtn: { width: "100%", background: "none", border: "1px dashed #222", borderRadius: 14, color: "#444", padding: "13px", fontSize: 13, cursor: "pointer", marginTop: 4 },
+  newForm: { background: "#141414", border: "1px solid #1e1e1e", borderRadius: 14, padding: "14px", marginTop: 4 },
+  newInput: { width: "100%", background: "#0e0e0e", border: "1px solid #333", borderRadius: 8, padding: "10px 12px", color: "#e8e8e8", fontSize: 14, outline: "none", boxSizing: "border-box", fontFamily: "inherit" },
+  cancelBtn: { flex: 1, background: "#1a1a1a", border: "none", borderRadius: 8, color: "#888", padding: "10px", fontSize: 13, cursor: "pointer" },
+  confirmBtn: { flex: 1, background: "#1a73e8", border: "none", borderRadius: 8, color: "#fff", padding: "10px", fontSize: 13, fontWeight: 700, cursor: "pointer" },
+  memoBtn: { width: "100%", background: "#120808", border: "1px solid #3a1010", borderRadius: 12, color: "#e8e8e8", padding: "12px 16px", fontSize: 13, cursor: "pointer", display: "flex", justifyContent: "space-between", marginBottom: 8 },
+  topBar: { display: "flex", alignItems: "center", gap: 10, padding: "14px 20px", borderBottom: "1px solid #151515" },
+  backBtn: { background: "none", border: "none", color: "#1a73e8", cursor: "pointer", fontSize: 13 },
+  topBarTitle: { flex: 1, fontWeight: 700, fontSize: 15 },
+  actionGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, padding: "14px 20px" },
+  actionBtn: { border: "none", borderRadius: 14, padding: "18px 10px", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 5, color: "#fff" },
+  aIcon: { fontSize: 22 }, aLabel: { fontSize: 12, fontWeight: 700 }, aSub: { fontSize: 9, color: "rgba(255,255,255,0.4)" },
+  wordRow: { display: "flex", alignItems: "center", justifyContent: "space-between", background: "#131313", borderRadius: 10, padding: "9px 12px", marginBottom: 5 },
+  wordEn: { fontSize: 14, fontWeight: 600, color: "#d0d0d0" },
+  wordJa: { fontSize: 11, color: "#555" },
+  badge: { fontSize: 10, padding: "2px 7px", borderRadius: 20, color: "#fff" },
+  delBtn: { background: "none", border: "none", color: "#333", cursor: "pointer", fontSize: 13 },
+  dangerBtn: { width: "100%", background: "#130808", border: "1px solid #3a1010", borderRadius: 10, color: "#ff5252", padding: "12px", fontSize: 13, cursor: "pointer" },
+  confirmBox: { background: "#130808", border: "1px solid #3a1010", borderRadius: 10, padding: "14px" },
+  addForm: { padding: "18px 20px", display: "flex", flexDirection: "column", gap: 12 },
+  input: { background: "#141414", border: "1px solid #1e1e1e", borderRadius: 10, padding: "13px 14px", color: "#e8e8e8", fontSize: 14, outline: "none", fontFamily: "inherit" },
+  primaryBtn: { width: "100%", background: "linear-gradient(135deg,#1565c0,#0d47a1)", border: "none", borderRadius: 10, padding: "13px", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" },
+  addedRow: { display: "flex", justifyContent: "space-between", background: "#131313", borderRadius: 8, padding: "8px 11px", marginBottom: 4, alignItems: "center" },
+  hintBox: { background: "#0d1a2e", border: "1px solid #1a2a4a", borderRadius: 12, padding: "14px 16px", marginBottom: 16 },
+  warnBox: { margin: "10px 20px", background: "#1a0808", border: "1px solid #3a1010", borderRadius: 10, padding: "10px 14px", color: "#ff7043", fontSize: 12 },
+  uploadBtn: { width: "100%", background: "linear-gradient(135deg,#6a1b9a,#4a148c)", border: "none", borderRadius: 10, padding: "13px", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" },
+  modeBtn: { flex: 1, background: "#141414", border: "1.5px solid #1e1e1e", borderRadius: 10, color: "#555", padding: "12px 5px", fontSize: 13, fontWeight: 600, cursor: "pointer" },
+  modeBtnOn: { background: "#091a38", border: "1.5px solid #1a73e8", color: "#e8e8e8" },
+  progTrack2: { height: 2, background: "#1a1a1a" },
+  progFill: { height: "100%", background: "#1a73e8", transition: "width 0.3s" },
+  qCard: { margin: "14px 20px 0", background: "#121218", border: "1px solid #1a1a1a", borderRadius: 16, padding: "28px 20px", minHeight: 100, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", position: "relative" },
+  speakBtn: { position: "absolute", top: 12, right: 14, background: "none", border: "none", fontSize: 16, cursor: "pointer" },
+  qWord: { fontSize: 26, fontWeight: 800, textAlign: "center" },
+  masteredBadge: { display: "inline-block", background: "#0a2a12", color: "#4caf50", fontSize: 10, padding: "2px 8px", borderRadius: 20, border: "1px solid #1b5e20" },
+  choiceBtn: { border: "1.5px solid #1e1e1e", borderRadius: 12, padding: "14px", cursor: "pointer", display: "flex", alignItems: "center", color: "#e8e8e8", fontSize: 15, transition: "all 0.1s" },
+  writeInput: { width: "100%", background: "#141414", border: "1px solid #222", borderRadius: 10, padding: "12px 14px", color: "#e8e8e8", fontSize: 16, outline: "none", fontFamily: "inherit", boxSizing: "border-box" },
+  hintBtn: { flex: 1, background: "#141414", border: "1px solid #1e1e1e", borderRadius: 10, color: "#666", padding: "10px", fontSize: 12, cursor: "pointer" },
+  ansBtn: { flex: 2, background: "#1a73e8", border: "none", borderRadius: 10, color: "#fff", padding: "10px", fontSize: 13, fontWeight: 700, cursor: "pointer" },
+  nextBtn: { width: "100%", background: "#141414", border: "1px solid #1e1e1e", borderRadius: 12, color: "#e8e8e8", padding: "13px", fontSize: 14, fontWeight: 600, cursor: "pointer" },
+  finishBox: { display: "flex", flexDirection: "column", alignItems: "center", padding: "60px 20px", gap: 8 },
+  slideCard: { margin: "14px 20px 0", background: "#121218", border: "1px solid #1a1a1a", borderRadius: 20, padding: "44px 20px", minHeight: 260, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer" },
+  slideBtn: { flex: 1, border: "none", borderRadius: 50, padding: "14px", color: "#e8e8e8", fontSize: 13, fontWeight: 700, cursor: "pointer" },
+};
+
+ReactDOM.createRoot(document.getElementById('root')).render(<VocabApp />);
+</script>
+</body>
+</html>
